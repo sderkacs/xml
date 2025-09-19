@@ -35,7 +35,7 @@ https://play.golang.org/p/-6Ee8tcLl2L
 ```go
 
 // Instead of "encoding/xml"
-import "github.com/nbio/xml"
+import "github.com/sderkacs/xml"
 ```
 
 ## Notes
