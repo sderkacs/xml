@@ -89,6 +89,21 @@ func Marshal(v any) ([]byte, error) {
 	return b.Bytes(), nil
 }
 
+func MarshalWithMappedNamespaces(v any, nsToPrefix map[string]string) ([]byte, error) {
+	var b bytes.Buffer
+	enc := NewEncoder(&b)
+
+	enc.nsToPrefix = nsToPrefix
+
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	if err := enc.Close(); err != nil {
+		return nil, err
+	}
+	return b.Bytes(), nil
+}
+
 // Marshaler is the interface implemented by objects that can marshal
 // themselves into valid XML elements.
 //
@@ -142,12 +157,15 @@ func MarshalIndent(v any, prefix, indent string) ([]byte, error) {
 
 // An Encoder writes XML data to an output stream.
 type Encoder struct {
-	p printer
+	p          printer
+	nsToPrefix map[string]string
 }
 
 // NewEncoder returns a new encoder that writes to w.
 func NewEncoder(w io.Writer) *Encoder {
-	e := &Encoder{printer{w: bufio.NewWriter(w)}}
+	e := &Encoder{
+		p: printer{w: bufio.NewWriter(w)},
+	}
 	e.p.encoder = e
 	return e
 }
@@ -167,7 +185,7 @@ func (enc *Encoder) Indent(prefix, indent string) {
 //
 // Encode calls [Encoder.Flush] before returning.
 func (enc *Encoder) Encode(v any) error {
-	err := enc.p.marshalValue(reflect.ValueOf(v), nil, nil)
+	err := enc.p.marshalValue(reflect.ValueOf(v), nil, nil, true)
 	if err != nil {
 		return err
 	}
@@ -182,7 +200,7 @@ func (enc *Encoder) Encode(v any) error {
 //
 // EncodeElement calls [Encoder.Flush] before returning.
 func (enc *Encoder) EncodeElement(v any, start StartElement) error {
-	err := enc.p.marshalValue(reflect.ValueOf(v), nil, &start)
+	err := enc.p.marshalValue(reflect.ValueOf(v), nil, &start, false)
 	if err != nil {
 		return err
 	}
@@ -462,7 +480,7 @@ var (
 
 // marshalValue writes one or more XML elements representing val.
 // If val was obtained from a struct field, finfo must have its details.
-func (p *printer) marshalValue(val reflect.Value, finfo *fieldInfo, startTemplate *StartElement) error {
+func (p *printer) marshalValue(val reflect.Value, finfo *fieldInfo, startTemplate *StartElement, propagateNS bool) error {
 	if startTemplate != nil && startTemplate.Name.Local == "" {
 		return fmt.Errorf("xml: EncodeElement of StartElement with missing name")
 	}
@@ -489,30 +507,30 @@ func (p *printer) marshalValue(val reflect.Value, finfo *fieldInfo, startTemplat
 
 	// Check for marshaler.
 	if val.CanInterface() && typ.Implements(marshalerType) {
-		return p.marshalInterface(val.Interface().(Marshaler), defaultStart(typ, finfo, startTemplate))
+		return p.marshalInterface(val.Interface().(Marshaler), defaultStart(typ, finfo, startTemplate, p.encoder))
 	}
 	if val.CanAddr() {
 		pv := val.Addr()
 		if pv.CanInterface() && pv.Type().Implements(marshalerType) {
-			return p.marshalInterface(pv.Interface().(Marshaler), defaultStart(pv.Type(), finfo, startTemplate))
+			return p.marshalInterface(pv.Interface().(Marshaler), defaultStart(pv.Type(), finfo, startTemplate, p.encoder))
 		}
 	}
 
 	// Check for text marshaler.
 	if val.CanInterface() && typ.Implements(textMarshalerType) {
-		return p.marshalTextInterface(val.Interface().(encoding.TextMarshaler), defaultStart(typ, finfo, startTemplate))
+		return p.marshalTextInterface(val.Interface().(encoding.TextMarshaler), defaultStart(typ, finfo, startTemplate, p.encoder))
 	}
 	if val.CanAddr() {
 		pv := val.Addr()
 		if pv.CanInterface() && pv.Type().Implements(textMarshalerType) {
-			return p.marshalTextInterface(pv.Interface().(encoding.TextMarshaler), defaultStart(pv.Type(), finfo, startTemplate))
+			return p.marshalTextInterface(pv.Interface().(encoding.TextMarshaler), defaultStart(pv.Type(), finfo, startTemplate, p.encoder))
 		}
 	}
 
 	// Slices and arrays iterate over the elements. They do not have an enclosing tag.
 	if (kind == reflect.Slice || kind == reflect.Array) && typ.Elem().Kind() != reflect.Uint8 {
 		for i, n := 0, val.Len(); i < n; i++ {
-			if err := p.marshalValue(val.Index(i), finfo, startTemplate); err != nil {
+			if err := p.marshalValue(val.Index(i), finfo, startTemplate, false); err != nil {
 				return err
 			}
 		}
@@ -538,7 +556,12 @@ func (p *printer) marshalValue(val reflect.Value, finfo *fieldInfo, startTemplat
 	} else if tinfo.xmlname != nil {
 		xmlname := tinfo.xmlname
 		if xmlname.name != "" {
-			start.Name.Space, start.Name.Local = xmlname.xmlns, joinPrefixed(xmlname.prefix, xmlname.name)
+			prefix, exists := p.encoder.nsToPrefix[xmlname.xmlns]
+			if exists {
+				start.Name.Local = joinPrefixed(prefix, xmlname.name)
+			} else {
+				start.Name.Space, start.Name.Local = xmlname.xmlns, joinPrefixed(xmlname.prefix, xmlname.name)
+			}
 		} else {
 			fv := xmlname.value(val, dontInitNilPointers)
 			if v, ok := fv.Interface().(Name); ok && v.Local != "" {
@@ -549,7 +572,12 @@ func (p *printer) marshalValue(val reflect.Value, finfo *fieldInfo, startTemplat
 		// No enforced namespace, i.e. the outer tag namespace remains valid
 	}
 	if start.Name.Local == "" && finfo != nil { // XMLName overrides tag name - anonymous struct
-		start.Name.Space, start.Name.Local = finfo.xmlns, joinPrefixed(finfo.prefix, finfo.name)
+		prefix, exists := p.encoder.nsToPrefix[finfo.xmlns]
+		if exists {
+			start.Name.Local = joinPrefixed(prefix, finfo.name)
+		} else {
+			start.Name.Space, start.Name.Local = finfo.xmlns, joinPrefixed(finfo.prefix, finfo.name)
+		}
 	}
 	if start.Name.Local == "" { // No or empty XMLName and still no tag name
 		name := typ.Name()
@@ -583,6 +611,12 @@ func (p *printer) marshalValue(val reflect.Value, finfo *fieldInfo, startTemplat
 		name := Name{Space: finfo.xmlns, Local: joinPrefixed(finfo.prefix, finfo.name)}
 		if err := p.marshalAttr(&start, name, fv); err != nil {
 			return err
+		}
+	}
+
+	if propagateNS {
+		for xmlns, prefix := range p.encoder.nsToPrefix {
+			start.Attr = append(start.Attr, Attr{Name: Name{Space: xmlnsURL, Local: prefix}, Value: xmlns})
 		}
 	}
 
@@ -706,7 +740,7 @@ func (p *printer) marshalAttr(start *StartElement, name Name, val reflect.Value)
 
 // defaultStart returns the default start element to use,
 // given the reflect type, field info, and start template.
-func defaultStart(typ reflect.Type, finfo *fieldInfo, startTemplate *StartElement) StartElement {
+func defaultStart(typ reflect.Type, finfo *fieldInfo, startTemplate *StartElement, encoder *Encoder) StartElement {
 	var start StartElement
 	// Precedence for the XML element name is as above,
 	// except that we do not look inside structs for the first field.
@@ -714,8 +748,14 @@ func defaultStart(typ reflect.Type, finfo *fieldInfo, startTemplate *StartElemen
 		start.Name = startTemplate.Name
 		start.Attr = append(start.Attr, startTemplate.Attr...)
 	} else if finfo != nil && finfo.name != "" {
-		start.Name.Local = joinPrefixed(finfo.prefix, finfo.name)
-		start.Name.Space = finfo.xmlns
+		prefix, exists := encoder.nsToPrefix[finfo.xmlns]
+		if exists {
+			start.Name.Local = joinPrefixed(prefix, finfo.name)
+			start.Name.Space = ""
+		} else {
+			start.Name.Local = joinPrefixed(finfo.prefix, finfo.name)
+			start.Name.Space = finfo.xmlns
+		}
 	} else if typ.Name() != "" {
 		start.Name.Local = typ.Name()
 	} else {
@@ -1095,7 +1135,7 @@ func (p *printer) marshalStruct(tinfo *typeInfo, val reflect.Value) error {
 				}
 			}
 		}
-		if err := p.marshalValue(vf, finfo, nil); err != nil {
+		if err := p.marshalValue(vf, finfo, nil, false); err != nil {
 			return err
 		}
 	}
